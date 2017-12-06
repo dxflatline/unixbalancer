@@ -1,4 +1,4 @@
-/// unixbalancer v0.1a
+/// unixbalancer v0.1
 /// Reads from a stream AF_UNIX socket and balances towards TCP/UDP. Applies regex. Fast (C).
 /// https://github.com/dxflatline/unixbalancer
 ///
@@ -43,7 +43,7 @@
 #include <fcntl.h>
 
 #define PROGNAME "unixbalancer"
-#define VERSION "0.1a"
+#define VERSION "0.1b"
 #define REFRESH_INTERVAL 10
 
 // Syslog server for logging
