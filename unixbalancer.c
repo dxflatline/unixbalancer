@@ -17,6 +17,7 @@
 ///
 /// Major Changelog:
 ///   v0.1a - First release (incomplete)
+///   v0.1b - 2nd release (working in production)
 ///
 /// Todo:
 ///   Correct signal to send stats and re-connect to destination
@@ -39,7 +40,7 @@
 #include <sys/stat.h>  
 #include <signal.h>
 #include <sys/resource.h>
-
+#include <fcntl.h>
 
 #define PROGNAME "unixbalancer"
 #define VERSION "0.1a"
@@ -50,10 +51,10 @@
 #define SYSLOG_HOST "127.0.0.1"
 
 // The number of bytes to read on every unix socket read
-#define UNIX_SOCKET_READMAX 100
+#define UNIX_SOCKET_READMAX 10000
 
 // The maximum number of bytes that a single message can be
-#define MAX_BUFFER 100000
+#define MAX_BUFFER 400000
 
 // The maximum unix socket clients
 #define MAX_CLIENTS 30
@@ -64,16 +65,18 @@
 // TEMP 
 #define SERVER "127.0.0.1"
 #define SERVPORT 5514
-#define PROTOCOL "UDP"
+#define PROTOCOL "TCP"
 
 
 // Global Variables
-char ubname[255] = "testlb";
+char ubname[255] = "akamailb";
+char ubpath[255] = "/var/run/unix_akamailb";
 
 typedef struct type_csocket {
   int fd;
   int buffer_size;
-  char buffer[MAX_BUFFER];
+  int trimmed;
+  char *buffer;
 } inst_csocket;
 
 
@@ -159,7 +162,7 @@ int regex_replace(char *src, const char *regex)
        }
        // Init a target string (rp) up to the size of the source (log)
        dest = (char *)malloc(strlen(src)*sizeof(char));
-       // DEBUG printf("Found match between index %d and %d\n", pmatch[0].rm_so, pmatch[0].rm_eo);
+       printf("Found match between index %d and %d\n", pmatch[0].rm_so, pmatch[0].rm_eo);
        // Move into target, everything except the data between the regex match
        // End with null byte
        memmove(dest, src, pmatch[0].rm_so);
@@ -183,26 +186,32 @@ int destination_connect() {
     char dest_servername[255];
     int dest_rc, dest_sd;
 
-    if (strcmp(PROTOCOL,"TCP")==0) {
-       if((dest_sd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
+    if ( strcmp(PROTOCOL,"TCP")==0 )
+    {
+       if((dest_sd = socket(AF_INET, SOCK_STREAM, 0)) < 0)
+       {
           perror("socket error");
+          return -1;
+       }
+       dest_socket.sin_family = AF_INET;
+       dest_socket.sin_port = htons(SERVPORT);
+       if (inet_aton(SERVER , &dest_socket.sin_addr) == 0)
+       {
+          perror("inet_aton error");
+          return -1;
+       }
+       if((dest_rc = connect(dest_sd, (struct sockaddr *)&dest_socket, sizeof(dest_socket))) < 0) {
+          perror("connect error");
+          close(dest_sd);
           return -1;
        }
     }
     else {
-       if((dest_sd = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
-          perror("socket error");    
+      if((dest_sd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)) < 0)
+      {
+          perror("socket error");
           return -1;
        }
-    }
-    strcpy(dest_servername, SERVER);
-    memset(&dest_socket, 0x00, sizeof(struct sockaddr_in));
-    dest_socket.sin_family = AF_INET;
-    dest_socket.sin_port = htons(SERVPORT);
-    if((dest_rc = connect(dest_sd, (struct sockaddr *)&dest_socket, sizeof(dest_socket))) < 0) {
-       perror("connect error");
-       close(dest_sd);
-       return -1;
     }
     sendlogs(LOG_INFO, "Connected to destination.");
     return dest_sd;
@@ -213,18 +222,41 @@ int destination_send(int sd, char *data, int len) {
     int rc;
     char temp;
     int length = sizeof(int);
-    //rc = write(sd, data, len);
-    rc = send(sd, data, len, MSG_NOSIGNAL);
-    printf("SENT %d\n", rc);
-    if(rc < 0)
-    { 
-       perror("write error");
-       sendlogs(LOG_WARNING, "Error writing to destination. Closing descriptor.");
-       close(sd);
-       return -1;
+
+    struct sockaddr_in dest_socket; // For UDP sendto
+    //char dest_servername[255];
+    
+    if ( strcmp(PROTOCOL,"UDP") == 0 )
+    {
+       //strcpy(dest_servername, SERVER);
+       memset(&dest_socket, 0x00, sizeof(struct sockaddr_in));
+       dest_socket.sin_family = AF_INET;
+       dest_socket.sin_port = htons(SERVPORT);
+       if (inet_aton(SERVER , &dest_socket.sin_addr) == 0) 
+       {
+          perror("inet_aton error");
+          return -1;
+       }
+       rc = sendto(sd, data, len, MSG_NOSIGNAL, (struct sockaddr *)&dest_socket, sizeof(struct sockaddr));
+       if(rc < 0)
+       {
+          perror("write udp error");
+          return -1;
+       }       
     }
-    else 
-       return rc;
+    else // TCP (already created socket) 
+    {
+       rc = send(sd, data, len, MSG_NOSIGNAL);
+       if(rc < 0)
+       { 
+          perror("write tcp error");
+          sendlogs(LOG_WARNING, "Error writing to destination. Closing descriptor.");
+          close(sd);
+          return -1;
+       }
+    }
+    // DEBUG printf("[D] TRANSMITTED %d bytes in socket\n", rc);
+    return rc;
 }
 
 
@@ -247,6 +279,19 @@ int main(int argc , char *argv[])
     // Vars - Read & process
     int valread, temp_buffersize;
     char unix_sock_readbuffer[UNIX_SOCKET_READMAX];
+
+
+    int forkme = 1, pid;
+    //Fork the Parent Process if requested
+    if (forkme==1) {
+      // Redirect stds
+      close(0); close(1); close(2);
+      open("/dev/null",O_RDWR); dup(0); dup(0);
+      // Do the forking
+      pid = fork();
+      if (pid < 0) { exit(EXIT_FAILURE); }
+      if (pid > 0) { exit(EXIT_SUCCESS); }
+    }
 
     
     /*
@@ -277,7 +322,7 @@ int main(int argc , char *argv[])
      * Create AF_UNIX listener
      *
      * */
-
+    umask(0);
     if( (master_socket = socket(AF_UNIX , SOCK_STREAM , 0)) == 0) 
     {
         perror("socket error");
@@ -291,7 +336,7 @@ int main(int argc , char *argv[])
         exit(EXIT_FAILURE);
     }  
     address.sun_family = AF_UNIX;
-    strcpy(address.sun_path, ubname);
+    strcpy(address.sun_path, ubpath);
     unlink(address.sun_path);
     len = strlen(address.sun_path) + sizeof(address.sun_family);
     if (bind(master_socket, (struct sockaddr *)&address, len)<0) 
@@ -309,6 +354,7 @@ int main(int argc , char *argv[])
     }      
     addrlen = sizeof(address);
     sendlogs(LOG_INFO, "Waiting for connection\n");
+    umask(022);
 
     printf("[*] Waiting for connections...\n");
 
@@ -318,7 +364,7 @@ int main(int argc , char *argv[])
      * Create sender socket
      *
      * */
-    if ((dest_sd = destination_connect()) > 0)
+    if ( (dest_sd = destination_connect()) > 0 )
         dest_status = 1;
     else 
         sendlogs(LOG_WARNING, "Error connecting to destination. Logs will drop until reconnect...");
@@ -333,8 +379,10 @@ int main(int argc , char *argv[])
     for (i = 0; i < MAX_CLIENTS; i++)
     {
         csocket[i].fd = 0;
+        csocket[i].buffer = (char *)malloc(MAX_BUFFER * sizeof(char));
         memset(csocket[i].buffer, 0, MAX_BUFFER);
         csocket[i].buffer_size = 0;
+        csocket[i].trimmed = 0;
     }
     while (1) 
     {
@@ -402,12 +450,15 @@ int main(int argc , char *argv[])
                     sendlogs(LOG_INFO, "Host disconnected\n");
 
                     // Retrieve data from socket buffer, send, clear
-                    csocket[i].buffer_size = regex_replace(csocket[i].buffer, REGEX);
-                    if ((dest_status == 1) && (destination_send(dest_sd, csocket[i].buffer, csocket[i].buffer_size) < 0)) {
+                    //csocket[i].buffer_size = regex_replace(csocket[i].buffer, REGEX);
+                    if (csocket[i].trimmed==1) {
+                       // DEBUG printf("[%d] Discarding trimmed log\n", i);
+                    }
+                    else if ((dest_status == 1) && (destination_send(dest_sd, csocket[i].buffer, csocket[i].buffer_size) < 0)) {
                        dest_status = 0;
                        sendlogs(LOG_WARNING, "Destination disabled. Will drop until reconnect...");
                     }
-                    printf("[%d] Emitting log of %d bytes\n", i, csocket[i].buffer_size);
+                    //DEBUG printf("[%d] Emitting log of %d bytes\n", i, csocket[i].buffer_size);
                     memset(csocket[i].buffer, 0, MAX_BUFFER);
                     csocket[i].buffer_size = 0;
                       
@@ -416,6 +467,7 @@ int main(int argc , char *argv[])
                     csocket[i].fd = 0;
                     memset(csocket[i].buffer, 0, MAX_BUFFER);
                     csocket[i].buffer_size = 0;
+                    csocket[i].trimmed = 0;
                 }
 
                 // Process message
@@ -438,8 +490,9 @@ int main(int argc , char *argv[])
                         temp_buffersize = line_end - line_start;
                     if ( csocket[i].buffer_size + temp_buffersize > MAX_BUFFER )
                     {
-                        printf("[%d] Trimming buffer!\n", i);
+                        // DEBUG printf("[%d] Trimming buffer!\n", i);
                         temp_buffersize = MAX_BUFFER - csocket[i].buffer_size - 1;
+                        csocket[i].trimmed = 1;
                     }
                     memmove(csocket[i].buffer + csocket[i].buffer_size, line_start, temp_buffersize);
                     csocket[i].buffer_size += temp_buffersize;
@@ -447,24 +500,25 @@ int main(int argc , char *argv[])
  
                     if (line_end) 
                     {
-                        printf("[%d] Found newline, emitting data and storing rest\n", i);
+                        //DEBUG printf("[%d] Found newline, emitting data and storing rest\n", i);
 
                         // Retrieve data from socket buffer, send and clear
-                        csocket[i].buffer_size = regex_replace(csocket[i].buffer, REGEX);
-                        if ((dest_status == 1) && (destination_send(dest_sd, csocket[i].buffer, csocket[i].buffer_size) < 0)) {
+                        //csocket[i].buffer_size = regex_replace(csocket[i].buffer, REGEX);
+                        if (csocket[i].trimmed==1) {
+                            // DEBUG printf("[%d] Discarding trimmed log\n", i);
+                        }
+                        else if ((dest_status == 1) && (destination_send(dest_sd, csocket[i].buffer, csocket[i].buffer_size) < 0)) {
                             dest_status = 0;
                             sendlogs(LOG_WARNING, "Destination disabled. Will drop until reconnect...");
                         }
-                        printf("[%d] Emitting log of %d bytes\n", i, csocket[i].buffer_size);
+                        //DEBUG printf("[%d] Emitting log of %d bytes\n", i, csocket[i].buffer_size);
                         memset(csocket[i].buffer, 0, MAX_BUFFER);
                         csocket[i].buffer_size = 0;
+                        csocket[i].trimmed = 0;
 
                         // Add data in socket buffer (after newline)
-                        // TODO: Uncomment if we want to pass the new line too (useful if destination is stream)
                         memmove(csocket[i].buffer, line_end, valread);
-                        //memmove(csocket[i].buffer, line_end+1, valread);
                         csocket[i].buffer_size = valread - (line_end - line_start); 
-                        //csocket[i].buffer_size = valread - (line_end - line_start) - 1;
                         csocket[i].buffer[csocket[i].buffer_size]='\0';
                         // DEBUG printf("[%d] New Buffer (size %d): %s\n", i, csocket[i].buffer_size, csocket[i].buffer);
 
