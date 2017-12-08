@@ -65,7 +65,7 @@
 // TEMP 
 #define SERVER "127.0.0.1"
 #define SERVPORT 5514
-#define PROTOCOL "UDP"
+#define PROTOCOL "TCP"
 
 
 // Global Variables
