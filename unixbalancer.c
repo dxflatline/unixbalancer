@@ -65,7 +65,7 @@
 // TEMP 
 #define SERVER "127.0.0.1"
 #define SERVPORT 5514
-#define PROTOCOL "TCP"
+#define PROTOCOL "UDP"
 
 
 // Global Variables
@@ -121,13 +121,14 @@ size_t getTotalSystemMemory()
  *  returns: none
  */
 void refresh(int signum){
-   char counter_message[200];
-   // Report memory usage
-   struct rusage r_usage;
-   getrusage(RUSAGE_SELF,&r_usage);
-   sprintf(counter_message, "MEM Used:%ld / Total:%zu", r_usage.ru_maxrss, getTotalSystemMemory());
-   sendlogs(LOG_INFO,counter_message);
-   fflush(stdout);
+   if (signum == SIGUSR1) {
+      char counter_message[200];
+      // Report memory usage
+      struct rusage r_usage;
+      getrusage(RUSAGE_SELF,&r_usage);
+      sprintf(counter_message, "MEM Used:%ld / Total:%zu", r_usage.ru_maxrss, getTotalSystemMemory());
+      sendlogs(LOG_INFO,counter_message);
+   }
 }
 
 
@@ -299,22 +300,7 @@ int main(int argc , char *argv[])
      * Signal handling
      *
      * */ 
- 
-    /*struct sigaction sa;
-    struct itimerval timer;
-    // Install handler as SIGVTALRM
-    memset (&sa, 0, sizeof (sa));
-    sa.sa_handler = &refresh;
-    sigaction (SIGVTALRM, &sa, NULL);
-    // Configure the timer to expire
-    timer.it_value.tv_sec = 0;
-    timer.it_value.tv_usec = 250000;
-    timer.it_interval.tv_sec = REFRESH_INTERVAL;
-    // Execute
-    if (setitimer (ITIMER_VIRTUAL, &timer, NULL))
-    {
-       perror("setitimer");
-    }*/
+    signal(SIGUSR1, refresh);
 
 
     /* 
