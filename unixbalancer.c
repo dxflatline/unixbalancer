@@ -17,7 +17,8 @@
 ///
 /// Major Changelog:
 ///   v0.1a - First release (incomplete)
-///   v0.1b - 2nd release (working in production)
+///   v0.1b - 2nd release (working version)
+///   v0.1c - Fixed memory allocation issues with regexes
 ///
 /// Todo:
 ///   Correct signal to send stats and re-connect to destination
@@ -43,7 +44,7 @@
 #include <fcntl.h>
 
 #define PROGNAME "unixbalancer"
-#define VERSION "0.1b"
+#define VERSION "0.1c"
 #define REFRESH_INTERVAL 10
 
 // Syslog server for logging
@@ -51,26 +52,27 @@
 #define SYSLOG_HOST "127.0.0.1"
 
 // The number of bytes to read on every unix socket read
-#define UNIX_SOCKET_READMAX 10000
+#define UNIX_SOCKET_READMAX 1024
 
 // The maximum number of bytes that a single message can be
 #define MAX_BUFFER 400000
 
 // The maximum unix socket clients
-#define MAX_CLIENTS 30
+#define MAX_CLIENTS 100
 
 // Regex to work with
-#define REGEX "\"cookie\":\"[^,]*\","
+#define REGEX1 ",\"cookie\":\"[^\"]*\""
+#define REGEX2 ",\"auth\":\"[^\"]*\""
 
 // TEMP 
 #define SERVER "127.0.0.1"
 #define SERVPORT 5514
-#define PROTOCOL "TCP"
+#define PROTOCOL "UDP"
 
 
 // Global Variables
-char ubname[255] = "akamailb";
-char ubpath[255] = "/var/run/unix_akamailb";
+char ubname[255] = "testlb";
+char ubpath[255] = "/var/run/unix_testlb";
 
 typedef struct type_csocket {
   int fd;
@@ -143,50 +145,41 @@ void refresh(int signum){
  *
  *  returns: strlen of modified string
  */
-int regex_replace(char *src, const char *regex)
+int regex_replace(char *src, int len, regex_t re)
 {
-    char *dest, *tempfree;
-    regex_t re;
+    char dest[MAX_BUFFER];
+    int newsize=0;
     regmatch_t pmatch[10];
-    // Compile regex and check
-    if (regcomp (&re, regex, REG_ICASE)) {
-       return strlen(src);
-    }
-    // Until no matches break this loop
-    while (1) {
-       // Do the regex matching up until one match
-       if (regexec (&re, src, 1, pmatch, 0)) {
-          break;
-       }
-       if (pmatch[0].rm_so == -1) {
-          break;
-       }
-       // Init a target string (rp) up to the size of the source (log)
-       dest = (char *)malloc(strlen(src)*sizeof(char));
-       printf("Found match between index %d and %d\n", pmatch[0].rm_so, pmatch[0].rm_eo);
-       // Move into target, everything except the data between the regex match
-       // End with null byte
-       memmove(dest, src, pmatch[0].rm_so);
-       memmove(&dest[pmatch[0].rm_so], &src[pmatch[0].rm_eo], strlen(src) - pmatch[0].rm_eo);
-       dest[strlen(src) - (pmatch[0].rm_eo - pmatch[0].rm_so)]='\0';
-       // DEBUG printf("Previous string length: %d\n",strlen(src));
-       // DEBUG printf("New string length: %d\n",strlen(dest));
-       // Move back to the source
-       memcpy(src, dest, strlen(dest));
-       free(dest);
-    }
-    // Cleanup regex
-    regfree (&re);
-    return strlen(src);
-}
 
+    // Do the regex matching up until one match
+    if (regexec (&re, src, 1, pmatch, 0)) {
+       return len;
+    }
+    if (pmatch[0].rm_so == -1) {
+       return len;
+    }       
+    // DEBUG printf("Found match between index %d and %d\n", pmatch[0].rm_so, pmatch[0].rm_eo);
+
+    // Move into target, everything except the data between the regex match
+    // End with null byte
+    memcpy(dest, src, pmatch[0].rm_so);
+    memcpy(&dest[pmatch[0].rm_so], &src[pmatch[0].rm_eo], len - pmatch[0].rm_eo);
+    newsize = len - (pmatch[0].rm_eo - pmatch[0].rm_so);
+    dest[newsize]='\0';
+    // DEBUG printf("Previous string length: %d\n",strlen(src));
+    // DEBUG printf("New string length: %d\n",strlen(dest));
+    // Move back to the source
+    memcpy(src, dest, newsize);
+    src[newsize]='\0';
+    // Return the length
+    return newsize;
+}
 
 
 int destination_connect() {
     struct sockaddr_in dest_socket;
     char dest_servername[255];
     int dest_rc, dest_sd;
-
     if ( strcmp(PROTOCOL,"TCP")==0 )
     {
        if((dest_sd = socket(AF_INET, SOCK_STREAM, 0)) < 0)
@@ -207,13 +200,19 @@ int destination_connect() {
           return -1;
        }
     }
-    else {
-      if((dest_sd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)) < 0)
+    else if ( strcmp(PROTOCOL,"UDP")==0 ) 
+    {
+      if ( (dest_sd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)) < 0)
       {
           perror("socket error");
           return -1;
-       }
+      }
     }
+    else 
+    {
+      return -1; 
+    }
+
     sendlogs(LOG_INFO, "Connected to destination.");
     return dest_sd;
 }
@@ -225,8 +224,8 @@ int destination_send(int sd, char *data, int len) {
     int length = sizeof(int);
 
     struct sockaddr_in dest_socket; // For UDP sendto
-    //char dest_servername[255];
-    
+
+
     if ( strcmp(PROTOCOL,"UDP") == 0 )
     {
        //strcpy(dest_servername, SERVER);
@@ -239,16 +238,16 @@ int destination_send(int sd, char *data, int len) {
           return -1;
        }
        rc = sendto(sd, data, len, MSG_NOSIGNAL, (struct sockaddr *)&dest_socket, sizeof(struct sockaddr));
-       if(rc < 0)
+       if (rc < 0)
        {
           perror("write udp error");
-          return -1;
+          return 0; // Do not block the UDP
        }       
     }
-    else // TCP (already created socket) 
+    else if ( strcmp(PROTOCOL,"TCP") == 0 )   //already created socket
     {
        rc = send(sd, data, len, MSG_NOSIGNAL);
-       if(rc < 0)
+       if (rc < 0)
        { 
           perror("write tcp error");
           sendlogs(LOG_WARNING, "Error writing to destination. Closing descriptor.");
@@ -256,6 +255,10 @@ int destination_send(int sd, char *data, int len) {
           return -1;
        }
     }
+    else {
+       return 0;
+    }
+
     // DEBUG printf("[D] TRANSMITTED %d bytes in socket\n", rc);
     return rc;
 }
@@ -281,7 +284,6 @@ int main(int argc , char *argv[])
     int valread, temp_buffersize;
     char unix_sock_readbuffer[UNIX_SOCKET_READMAX];
 
-
     int forkme = 1, pid;
     //Fork the Parent Process if requested
     if (forkme==1) {
@@ -293,14 +295,13 @@ int main(int argc , char *argv[])
       if (pid < 0) { exit(EXIT_FAILURE); }
       if (pid > 0) { exit(EXIT_SUCCESS); }
     }
-
-    
+  
     /*
      *
      * Signal handling
      *
      * */ 
-    signal(SIGUSR1, refresh);
+    //signal(SIGUSR1, refresh);
 
 
     /* 
@@ -339,7 +340,7 @@ int main(int argc , char *argv[])
         exit(EXIT_FAILURE);
     }      
     addrlen = sizeof(address);
-    sendlogs(LOG_INFO, "Waiting for connection\n");
+    sendlogs(LOG_INFO, "Waiting for connection");
     umask(022);
 
     printf("[*] Waiting for connections...\n");
@@ -355,12 +356,29 @@ int main(int argc , char *argv[])
     else 
         sendlogs(LOG_WARNING, "Error connecting to destination. Logs will drop until reconnect...");
 
+
+    /*
+     *
+     * Compile regexes for pattern matching
+     *
+     * */
+    regex_t re1, re2;
+    if ( regcomp (&re1, REGEX1, 0)==0 && regcomp (&re2, REGEX2, 0)==0 ) {
+        printf("[*] Successfully compiled regexes...\n");
+        sendlogs(LOG_INFO, "Successfully compiled regexes");
+    }
+    else {
+        perror("regcomp error");
+        sendlogs(LOG_ERR, "Error compiling regexes");
+        exit(EXIT_FAILURE);
+    }
+
+
     /*
      *                 
      * IO Loop
      *
      * */
-
     // Initialise all client_socket[] to 0 so not checked
     for (i = 0; i < MAX_CLIENTS; i++)
     {
@@ -436,7 +454,8 @@ int main(int argc , char *argv[])
                     sendlogs(LOG_INFO, "Host disconnected\n");
 
                     // Retrieve data from socket buffer, send, clear
-                    //csocket[i].buffer_size = regex_replace(csocket[i].buffer, REGEX);
+                    // NO NEED LAST MSG - csocket[i].buffer_size = regex_replace(csocket[i].buffer, REGEX1);  
+                    // NO NEED LAST MSG - csocket[i].buffer_size = regex_replace(csocket[i].buffer, REGEX2);
                     if (csocket[i].trimmed==1) {
                        // DEBUG printf("[%d] Discarding trimmed log\n", i);
                     }
@@ -459,16 +478,17 @@ int main(int argc , char *argv[])
                 // Process message
                 else
                 {
+                    // Append and line terminator just to be safe
                     unix_sock_readbuffer[valread] = '\0';
                     
-                    // DEBUG printf("[%d] AF_UNIX read (%d bytes): %s\n", i, valread, unix_sock_readbuffer);
+                    //printf("[%d] AF_UNIX read (%d bytes): %s\n", i, valread, unix_sock_readbuffer);
 
                     // Check for newline in order to split message and keep the rest
                     char *line_start = unix_sock_readbuffer;
                     char *line_end;
                     line_end = (char*)memchr((void*)line_start, '\n', valread);
 
-                    // Add read data to current buffer (either all or until newline)
+                    // Add read data to current buffer (either all or until newline found above)
                     //  Trim buffer to avoid BUS ERROR from overflow
                     if (line_end==NULL) 
                         temp_buffersize = valread;
@@ -482,14 +502,18 @@ int main(int argc , char *argv[])
                     }
                     memmove(csocket[i].buffer + csocket[i].buffer_size, line_start, temp_buffersize);
                     csocket[i].buffer_size += temp_buffersize;
-                    csocket[i].buffer[csocket[i].buffer_size]='\0';
- 
-                    if (line_end) 
-                    {
-                        //DEBUG printf("[%d] Found newline, emitting data and storing rest\n", i);
+                    csocket[i].buffer[csocket[i].buffer_size]='\n';
 
+                    // If NO newline was found, BUT the read length in less than MAX -- OR
+                    // If newline WAS found
+                    //  --> we can send the current buffer and clear it           
+                    if ( (valread < UNIX_SOCKET_READMAX - UNIX_SOCKET_READMAX / 10) || line_end  ) 
+                    {
                         // Retrieve data from socket buffer, send and clear
-                        //csocket[i].buffer_size = regex_replace(csocket[i].buffer, REGEX);
+                        csocket[i].buffer_size = regex_replace(csocket[i].buffer, csocket[i].buffer_size, re1);
+                        csocket[i].buffer_size = regex_replace(csocket[i].buffer, csocket[i].buffer_size, re2);
+                        csocket[i].buffer[csocket[i].buffer_size++]='\n';
+                        csocket[i].buffer[csocket[i].buffer_size]='\0';
                         if (csocket[i].trimmed==1) {
                             // DEBUG printf("[%d] Discarding trimmed log\n", i);
                         }
@@ -501,13 +525,20 @@ int main(int argc , char *argv[])
                         memset(csocket[i].buffer, 0, MAX_BUFFER);
                         csocket[i].buffer_size = 0;
                         csocket[i].trimmed = 0;
+                    }
 
-                        // Add data in socket buffer (after newline)
-                        memmove(csocket[i].buffer, line_end, valread);
-                        csocket[i].buffer_size = valread - (line_end - line_start); 
-                        csocket[i].buffer[csocket[i].buffer_size]='\0';
-                        // DEBUG printf("[%d] New Buffer (size %d): %s\n", i, csocket[i].buffer_size, csocket[i].buffer);
-
+                    // If newline was found, add the rest of split data to the buffer for next round
+                    if (line_end) 
+                    {
+                        if (valread != line_end - line_start + 1) // Edge condition, if \n is last byte, ignore rest
+                        { 
+                           memcpy(csocket[i].buffer, line_end + 1, valread - 1); // +1 to account for the /n itself
+                           csocket[i].buffer_size = valread - (line_end - line_start) - 1; 
+                           csocket[i].buffer[csocket[i].buffer_size]='\0';
+                           if ( *(line_end + 1)!=123 ) {
+                              sendlogs(LOG_WARNING, "Buffer after split not starting with curly brace");
+                           }
+                        }
                     }
 
                 }
